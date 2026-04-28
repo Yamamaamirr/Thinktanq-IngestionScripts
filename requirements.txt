@@ -1,0 +1,9 @@
+geopandas>=0.14
+pandas>=2.0
+numpy>=1.26
+requests>=2.31
+shapely>=2.0
+pyproj>=3.6
+pyarrow>=14.0
+urllib3>=2.0
+rapidfuzz>=3.0
