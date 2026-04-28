@@ -15,8 +15,8 @@ What it IS NOT:
   - No substations (see hifld_electric_substations script)
   - No generation / capacity data (see eia_form860 script)
 
-Voltage → class_rating mapping (used by parcel scoring engine):
-  735 kV+ / DC  →  class_0   (ultra-high, backbone inter-regional)
+Voltage → class_rating mapping (used by parcel scoring engine, matches PRD class_weight_mapping):
+  735 kV+ / DC  →  class_1   (regional backbone and above — PRD has no class_0)
   345–500 kV    →  class_1   (high, regional backbone)
   220–287 kV    →  class_2   (medium, sub-regional / metro feeds)
 
@@ -26,7 +26,7 @@ Output schema (PostGIS GEOMETRY(LINESTRING, 4326)):
   owner          TEXT      utility / owner name
   substation_from TEXT     upstream substation name
   substation_to   TEXT     downstream substation name
-  class_rating   TEXT      class_0 / class_1 / class_2
+  class_rating   TEXT      class_1 / class_2
   geometry       LINESTRING(4326)
   ingested_at    TIMESTAMPTZ
 """
@@ -55,8 +55,8 @@ CLASS_RATING_MAP = {
     '220-287':       'class_2',
     '345':           'class_1',
     '500':           'class_1',
-    '735 AND ABOVE': 'class_0',
-    'DC':            'class_0',
+    '735 AND ABOVE': 'class_1',
+    'DC':            'class_1',
 }
 
 # ── Load ─────────────────────────────────────────────────────────────────────
