@@ -1,210 +1,385 @@
-"""HIFLD Electric Power Substations ingestion.
+"""Electric substation ingestion — layered OSM / HIFLD approach.
 
-Source: HIFLD (Homeland Infrastructure Foundation-Level Data), DHS/CISA.
-        Live ArcGIS REST service — paginated fetch, cached to parquet.
+Sources in priority order:
+  1. OpenStreetMap Overpass API — power=substation, voltage >= 69 kV; all 50 states;
+     near-realtime, community-maintained, more current than HIFLD by 4+ years.
+  2. HIFLD (national fallback) — covers substations OSM hasn't mapped yet, and
+     fills the California gap where HIFLD has slightly better coverage than OSM.
 
-What this dataset IS:
-  Every electric power substation in the US at 69 kV and above, as reported
-  by utilities to HIFLD. Substations with MAX_VOLT < 69 kV may be present
-  but coverage is not guaranteed.
+Spatial deduplication (DEDUP_RADIUS_M = 500 m, EPSG:5070 Conus Albers):
+  Before adding HIFLD records, drop any HIFLD point within 500 m of an OSM point.
+  Same physical substation in both sources → keep the OSM version (more current).
 
-What it IS NOT:
-  - No transmission lines (see hifld_transmission_lines script)
-  - No generation / capacity data (see eia_form860 script)
+State assignment for OSM:
+  state_abbr is set from the state ISO code used in each Overpass query — no spatial
+  join needed. OSM addr:state tag is present on < 2% of US substations.
 
-Voltage → class_rating mapping (based on MAX_VOLT, matches PRD class_weight_mapping):
-  >= 345 kV  →  class_1   (345/500/765kV — regional backbone and above)
-  230–287 kV →  class_2   (sub-regional / metro feeds)
-  69–161 kV  →  class_3   (lower transmission / sub-transmission)
-  < 69 kV    →  sub_class (distribution voltage)
-  TAP        →  class_3   (tap points forced to class_3 regardless of voltage)
-  no voltage →  NULL      (18.5% of IN SERVICE non-TAP records; utility did not file voltage)
-
-MAX_INFER flag: HIFLD field indicating HOW the MAX_VOLT value was obtained.
-  'Y' = HIFLD inferred the voltage from connected transmission line filings.
-  'N' = Voltage was directly reported by the utility.
-  This is a data-quality flag on MAX_VOLT, NOT a separate fallback voltage value.
-  When MAX_VOLT is null, MAX_INFER is still Y/N but there is no voltage to use.
-
-volt_source in output:
-  'reported'       — MAX_VOLT present, utility directly filed it (MAX_INFER='N')
-  'hifld_inferred' — MAX_VOLT present, HIFLD derived it from connected lines (MAX_INFER='Y')
-  'tap'            — TYPE=TAP, forced class_3
-  NULL             — no voltage data; scoring engine must fall back to transmission
-                     line proximity for parcels near these substations
-
-Data profile (as of last ingestion):
-  72,364 IN SERVICE substations
-  class_1: ~1,904 (345 kV and above — includes 345/500/765 kV)
-  class_2: ~3,821 (230–287 kV)
-  class_3: ~51,104 (69–161 kV or TAP)
-  sub_class: ~2,134 (< 69 kV)
-  NULL:    ~13,401 (18.5% of IN SERVICE — no recovery path within HIFLD)
+Voltage → class_rating (PRD class_weight_mapping):
+  >= 345 kV  →  class_1    regional backbone (345/500/765 kV)
+  230–344 kV →  class_2    sub-regional / metro feeds
+  69–229 kV  →  class_3    lower transmission / sub-transmission
+  < 69 kV    →  sub_class  distribution
+  unknown    →  NULL       scoring engine falls back to tx-line proximity
 
 Output schema (PostGIS GEOMETRY(POINT, 4326)):
-  name                TEXT
-  city                TEXT
-  state_abbr          TEXT
-  county              TEXT
-  substation_type     TEXT
-  max_volt            NUMERIC   highest voltage at substation (kV), nullable
-  min_volt            NUMERIC   lowest voltage at substation (kV), nullable
-  max_volt_inferred   BOOLEAN   True if HIFLD inferred max_volt (vs utility-reported)
-  lines               INTEGER   number of connected transmission lines
-  class_rating        TEXT      class_1/class_2/class_3/sub_class/NULL
-  volt_source         TEXT      'reported'/'hifld_inferred'/'tap'/NULL
-  source_date         DATE
-  val_date            DATE
-  geometry            POINT(4326)
-  ingested_at         TIMESTAMPTZ
+  name              TEXT
+  state_abbr        TEXT
+  substation_type   TEXT        'transmission'/'distribution'/'tap'/'unknown'
+  max_volt          NUMERIC     kV, nullable
+  min_volt          NUMERIC     kV, nullable (HIFLD records only)
+  max_volt_inferred BOOLEAN     True if HIFLD inferred voltage (HIFLD only)
+  lines             INTEGER     connected tx lines (HIFLD only)
+  class_rating      TEXT        class_1/class_2/class_3/sub_class/NULL
+  volt_source       TEXT        'osm'/'reported'/'hifld_inferred'/'tap'/NULL
+  data_source       TEXT        'osm'/'hifld'
+  geometry          POINT(4326)
+  ingested_at       TIMESTAMPTZ
 """
-import requests
+import time
+from pathlib import Path
+
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from pathlib import Path
+import requests
+from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
 
-BASE_URL = (
-    "https://services6.arcgis.com/OO2s4OoyCZkYJ6oE/arcgis/rest/services/"
-    "Substations/FeatureServer/0/query"
+HERE         = Path(__file__).parent
+OSM_CACHE   = HERE / 'cache_osm'       # one .parquet per state inside this dir
+HIFLD_CACHE = HERE / 'raw_substations.parquet'  # existing cache from previous runs
+OUT_PARQUET = HERE / 'hifld_electric_substations.parquet'
+
+DEDUP_RADIUS_M = 500
+OVERPASS_URL   = 'https://overpass-api.de/api/interpreter'
+OVERPASS_UA    = 'ThinqTank-SubstationIngestion/1.0'
+HIFLD_URL      = (
+    'https://services6.arcgis.com/OO2s4OoyCZkYJ6oE/arcgis/rest/services/'
+    'Substations/FeatureServer/0/query'
 )
-CACHE_FILE = Path(__file__).parent / 'raw_substations.parquet'
-OUT_PARQUET = Path(__file__).parent / 'hifld_electric_substations.parquet'
+HIFLD_SENTINEL = -999999.0
 
-KEEP_COLS = ['NAME', 'CITY', 'STATE', 'COUNTY', 'TYPE', 'STATUS',
-             'MAX_VOLT', 'MIN_VOLT', 'MAX_INFER', 'LINES',
-             'SOURCEDATE', 'VAL_DATE', 'geometry']
+US_STATES = [
+    'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+    'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+    'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+    'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+    'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY',
+]
 
-SENTINEL = -999999.0
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_voltage_kv(raw) -> float | None:
+    """Parse OSM voltage tag to kV float.
+
+    Handles: '138000' (volts), '69000;138000' (multi-voltage), '138 kV', '138'.
+    Returns the maximum when semicolon-joined.
+    """
+    if not raw or pd.isna(raw):
+        return None
+    values = []
+    for part in str(raw).split(';'):
+        cleaned = part.lower().replace('kv', '').replace('k', '').replace(' ', '')
+        try:
+            v = float(cleaned)
+            if v >= 1000:
+                v /= 1000
+            values.append(v)
+        except ValueError:
+            continue
+    return max(values) if values else None
 
 
-# ── Fetch (cached) ────────────────────────────────────────────────────────────
-
-if CACHE_FILE.exists():
-    print("Loading from cache...")
-    gdf = gpd.read_parquet(CACHE_FILE)
-else:
-    all_features = []
-    offset = 0
-    while True:
-        params = {
-            'where': '1=1',
-            'outFields': '*',
-            'resultOffset': offset,
-            'resultRecordCount': 2000,
-            'f': 'geojson',
-        }
-        r = requests.get(BASE_URL, params=params, timeout=30)
-        r.raise_for_status()
-        features = r.json().get('features', [])
-        if not features:
-            break
-        all_features.extend(features)
-        offset += 2000
-        print(f"Fetched {offset} records...")
-
-    gdf = gpd.GeoDataFrame.from_features(all_features, crs='EPSG:4326')
-    gdf.to_parquet(CACHE_FILE)
-    print(f"Cached {len(gdf)} rows to {CACHE_FILE}")
-
-print(f"Raw rows: {len(gdf):,}")
-
-# ── Select columns and clean sentinels ───────────────────────────────────────
-
-gdf = gdf[KEEP_COLS].copy()
-gdf = gdf.dropna(subset='geometry')
-
-for col in ('MAX_VOLT', 'MIN_VOLT', 'LINES'):
-    gdf[col] = gdf[col].replace(SENTINEL, np.nan)
-
-gdf['SOURCEDATE'] = pd.to_datetime(gdf['SOURCEDATE'], unit='ms', errors='coerce')
-gdf['VAL_DATE']   = pd.to_datetime(gdf['VAL_DATE'],   unit='ms', errors='coerce')
-
-# ── Filter ────────────────────────────────────────────────────────────────────
-
-gdf = gdf[gdf['STATUS'] == 'IN SERVICE'].copy()
-print(f"After IN SERVICE filter: {len(gdf):,}")
-
-# ── Class rating ──────────────────────────────────────────────────────────────
-# MAX_INFER is a Y/N flag on MAX_VOLT (was it inferred or directly reported?).
-# It is NOT a fallback voltage value. When MAX_VOLT is null, class_rating is NULL.
-
-def _voltage_to_class(v):
-    if v >= 345: return 'class_1'
-    if v >= 230: return 'class_2'
-    if v >= 69:  return 'class_3'
+def _volt_to_class(kv) -> str | None:
+    if kv is None or pd.isna(kv):
+        return None
+    if kv >= 345: return 'class_1'
+    if kv >= 230: return 'class_2'
+    if kv >= 69:  return 'class_3'
     return 'sub_class'
 
-def assign_class(row):
-    if row['TYPE'] == 'TAP':
-        return 'class_3'
-    if pd.notna(row['MAX_VOLT']):
-        return _voltage_to_class(row['MAX_VOLT'])
-    return pd.NA
 
-def assign_volt_source(row):
-    if row['TYPE'] == 'TAP':
-        return 'tap'
-    if pd.notna(row['MAX_VOLT']):
-        return 'hifld_inferred' if row['MAX_INFER'] == 'Y' else 'reported'
-    return pd.NA
+def _dedup(high: gpd.GeoDataFrame, low: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Return rows of `low` not within DEDUP_RADIUS_M of any row in `high`."""
+    if high.empty or low.empty:
+        return low
+    high_proj = high.to_crs(epsg=5070)
+    low_proj  = low.to_crs(epsg=5070)
+    high_buf  = high_proj.copy()
+    high_buf['geometry'] = high_buf.geometry.buffer(DEDUP_RADIUS_M)
+    joined = gpd.sjoin(low_proj, high_buf[['geometry']], how='left', predicate='within')
+    unique = joined[~joined.index.duplicated(keep='first')]
+    return low.loc[unique[unique['index_right'].isna()].index].copy()
 
-gdf['class_rating'] = gdf.apply(assign_class, axis=1)
-gdf['volt_source']  = gdf.apply(assign_volt_source, axis=1)
 
-# ── Rename to canonical schema ────────────────────────────────────────────────
+def _overpass_post(query: str, timeout_s: int = 95) -> list:
+    """POST to Overpass with retry. Returns list of elements."""
+    data = {'data': query}
+    for attempt, delay in enumerate([0, 15, 30, 60]):
+        if delay:
+            print(f"    retry in {delay}s...")
+            time.sleep(delay)
+        try:
+            r = requests.post(
+                OVERPASS_URL,
+                data=data,
+                headers={'User-Agent': OVERPASS_UA},
+                timeout=timeout_s,
+            )
+            r.raise_for_status()
+            return r.json().get('elements', [])
+        except (ConnectionError, Timeout, ChunkedEncodingError) as e:
+            print(f"    network error: {type(e).__name__}")
+        except requests.HTTPError as e:
+            print(f"    HTTP {e.response.status_code}")
+    raise RuntimeError(f"Overpass: max retries exceeded for query")
 
-gdf = gdf.rename(columns={
-    'NAME':       'name',
-    'CITY':       'city',
-    'STATE':      'state_abbr',
-    'COUNTY':     'county',
-    'TYPE':       'substation_type',
-    'MAX_VOLT':   'max_volt',
-    'MIN_VOLT':   'min_volt',
-    'LINES':      'lines',
-    'SOURCEDATE': 'source_date',
-    'VAL_DATE':   'val_date',
-})
-gdf['max_volt_inferred'] = gdf['MAX_INFER'] == 'Y'
-gdf = gdf.drop(columns=['STATUS', 'MAX_INFER'])
-gdf['ingested_at'] = pd.Timestamp.utcnow()
+
+# ── Layer 1: OpenStreetMap (all 50 states, cached per state) ─────────────────
+
+def _fetch_osm_state(state: str) -> gpd.GeoDataFrame:
+    """Fetch OSM substations for one state. Returns GDF with >=69kV records."""
+    cache_path = OSM_CACHE / f'{state}.parquet'
+    if cache_path.exists():
+        return gpd.read_parquet(cache_path)
+
+    query = (
+        f'[out:json][timeout:90];'
+        f'area["ISO3166-2"="US-{state}"]->.s;'
+        f'('
+        f'  node["power"="substation"]["voltage"](area.s);'
+        f'  way["power"="substation"]["voltage"](area.s);'
+        f'  relation["power"="substation"]["voltage"](area.s);'
+        f');'
+        f'out center tags;'
+    )
+    elements = _overpass_post(query)
+
+    rows = []
+    for el in elements:
+        tags = el.get('tags', {})
+        kv = _parse_voltage_kv(tags.get('voltage'))
+        if kv is None or kv < 69:
+            continue
+        if el['type'] == 'node':
+            lat, lon = el['lat'], el['lon']
+        elif 'center' in el:
+            lat, lon = el['center']['lat'], el['center']['lon']
+        else:
+            continue
+        rows.append({
+            'name':            tags.get('name') or tags.get('ref') or '',
+            'state_abbr':      state,
+            'substation_type': tags.get('substation', 'unknown'),
+            'max_volt':        kv,
+            'min_volt':        np.nan,
+            'max_volt_inferred': pd.NA,
+            'lines':           np.nan,
+            'volt_source':     'osm',
+            'lat': lat, 'lon': lon,
+        })
+
+    if rows:
+        df = pd.DataFrame(rows)
+        gdf = gpd.GeoDataFrame(
+            df,
+            geometry=gpd.points_from_xy(df['lon'], df['lat']),
+            crs='EPSG:4326',
+        ).drop(columns=['lat', 'lon'])
+    else:
+        gdf = gpd.GeoDataFrame(
+            columns=['name', 'state_abbr', 'substation_type', 'max_volt',
+                     'min_volt', 'max_volt_inferred', 'lines', 'volt_source', 'geometry'],
+            crs='EPSG:4326',
+        )
+
+    gdf.to_parquet(cache_path)
+    return gdf
+
+
+def _fetch_osm_all() -> gpd.GeoDataFrame:
+    OSM_CACHE.mkdir(exist_ok=True)
+    cached = [s for s in US_STATES if (OSM_CACHE / f'{s}.parquet').exists()]
+    needed = [s for s in US_STATES if s not in cached]
+
+    if cached:
+        print(f"  OSM: {len(cached)} states already cached, fetching {len(needed)} remaining")
+    else:
+        print(f"  OSM: fetching all {len(US_STATES)} states from Overpass API")
+
+    gdfs = []
+    # Load cached states
+    for s in cached:
+        gdfs.append(gpd.read_parquet(OSM_CACHE / f'{s}.parquet'))
+
+    # Fetch uncached states
+    for i, s in enumerate(needed):
+        print(f"  OSM [{i+1}/{len(needed)}] {s}...", end=' ', flush=True)
+        gdf_s = _fetch_osm_state(s)
+        print(f"{len(gdf_s):,} substations")
+        gdfs.append(gdf_s)
+        if i < len(needed) - 1:
+            time.sleep(1)  # be polite to Overpass
+
+    result = gpd.GeoDataFrame(
+        pd.concat([g for g in gdfs if not g.empty], ignore_index=True),
+        crs='EPSG:4326',
+    )
+    result['data_source'] = 'osm'
+    return result
+
+
+# ── Layer 2: HIFLD (national fallback) ───────────────────────────────────────
+
+def _fetch_hifld() -> gpd.GeoDataFrame:
+    if HIFLD_CACHE.exists():
+        print("  HIFLD: loading from cache (raw_substations.parquet)...")
+        raw = gpd.read_parquet(HIFLD_CACHE)
+    else:
+        print("  HIFLD: fetching from ArcGIS REST (no cache found)...")
+        all_features, offset = [], 0
+        while True:
+            r = requests.get(
+                HIFLD_URL,
+                params={'where': '1=1', 'outFields': '*',
+                        'resultOffset': offset, 'resultRecordCount': 2000, 'f': 'geojson'},
+                timeout=30,
+            )
+            r.raise_for_status()
+            feats = r.json().get('features', [])
+            if not feats:
+                break
+            all_features.extend(feats)
+            offset += len(feats)
+            print(f"    HIFLD fetched {offset:,}...")
+            if len(feats) < 2000:
+                break
+        raw = gpd.GeoDataFrame.from_features(all_features, crs='EPSG:4326')
+        raw.to_parquet(HIFLD_CACHE)
+
+    print(f"  HIFLD: {len(raw):,} total rows in cache")
+
+    for col in ('MAX_VOLT', 'MIN_VOLT', 'LINES'):
+        if col in raw.columns:
+            raw[col] = raw[col].replace(HIFLD_SENTINEL, np.nan)
+
+    gdf = raw[raw['STATUS'] == 'IN SERVICE'].dropna(subset='geometry').copy()
+    gdf['SOURCEDATE'] = pd.to_datetime(gdf.get('SOURCEDATE'), unit='ms', errors='coerce')
+    gdf['VAL_DATE']   = pd.to_datetime(gdf.get('VAL_DATE'),   unit='ms', errors='coerce')
+
+    def _volt_source(row):
+        if row.get('TYPE') == 'TAP': return 'tap'
+        if pd.notna(row.get('MAX_VOLT')):
+            return 'hifld_inferred' if row.get('MAX_INFER') == 'Y' else 'reported'
+        return None
+
+    result = gpd.GeoDataFrame({
+        'name':             gdf.get('NAME', pd.Series(dtype=str)).fillna(''),
+        'state_abbr':       gdf.get('STATE', pd.Series(dtype=str)).fillna(''),
+        'substation_type':  gdf.get('TYPE',  pd.Series(dtype=str)).fillna('unknown'),
+        'max_volt':         gdf.get('MAX_VOLT'),
+        'min_volt':         gdf.get('MIN_VOLT'),
+        'max_volt_inferred': (gdf.get('MAX_INFER') == 'Y'),
+        'lines':            gdf.get('LINES'),
+        'volt_source':      gdf.apply(_volt_source, axis=1),
+        'data_source':      'hifld',
+        'geometry':         gdf['geometry'],
+    }, crs='EPSG:4326')
+
+    print(f"  HIFLD: {len(result):,} IN SERVICE substations")
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("=== Electric Substation Ingestion (layered OSM / HIFLD) ===\n")
+
+# ── Layer 1: OSM ──────────────────────────────────────────────────────────────
+print("Layer 1: OpenStreetMap (all 50 states)")
+gdf_osm = _fetch_osm_all()
+print(f"  Total OSM: {len(gdf_osm):,} substations >= 69 kV\n")
+
+# ── Layer 2: HIFLD (national fallback) ───────────────────────────────────────
+print("Layer 2: HIFLD (national fallback)")
+gdf_hifld = _fetch_hifld()
+gdf_hifld_new = _dedup(gdf_osm, gdf_hifld)
+n_hifld_drop = len(gdf_hifld) - len(gdf_hifld_new)
+print(f"  {len(gdf_hifld):,} HIFLD total -> {len(gdf_hifld_new):,} after dedup "
+      f"({n_hifld_drop} within {DEDUP_RADIUS_M}m of OSM)\n")
+
+# ── Merge ─────────────────────────────────────────────────────────────────────
+SCHEMA = ['name', 'state_abbr', 'substation_type', 'max_volt', 'min_volt',
+          'max_volt_inferred', 'lines', 'volt_source', 'data_source', 'geometry']
+
+all_layers = [gdf_osm, gdf_hifld_new]
+aligned = []
+for g in all_layers:
+    if g.empty:
+        continue
+    g = g.copy()
+    for col in SCHEMA:
+        if col not in g.columns:
+            g[col] = np.nan
+    aligned.append(g[SCHEMA])
+
+gdf = gpd.GeoDataFrame(pd.concat(aligned, ignore_index=True), crs='EPSG:4326')
+
+# Cast max_volt_inferred to nullable boolean — OSM rows have pd.NA, HIFLD rows
+# have True/False; concat produces object dtype without this explicit cast.
+gdf['max_volt_inferred'] = gdf['max_volt_inferred'].astype('boolean')
+
+# ── Class rating ──────────────────────────────────────────────────────────────
+gdf['class_rating'] = gdf.apply(
+    lambda r: 'class_3' if r['substation_type'] == 'TAP'
+              else _volt_to_class(r['max_volt']),
+    axis=1,
+)
+
+gdf['ingested_at'] = pd.Timestamp.now(tz='UTC')
 
 # ── Validation ────────────────────────────────────────────────────────────────
-
-assert len(gdf) > 50_000, f"Suspiciously low substation count: {len(gdf):,}"
+assert len(gdf) > 50_000, f"Suspiciously low count: {len(gdf):,}"
 assert gdf.geom_type.eq('Point').all(), "Non-Point geometry found"
-assert gdf.geometry.is_valid.all(), "Invalid geometries detected"
+assert gdf.geometry.is_valid.all(), "Invalid geometries"
 valid_classes = {'class_1', 'class_2', 'class_3', 'sub_class'}
-actual_classes = set(gdf['class_rating'].dropna().unique())
-assert actual_classes <= valid_classes, f"Unexpected class values: {actual_classes - valid_classes}"
+assert set(gdf['class_rating'].dropna().unique()) <= valid_classes
 
 # ── Summary ───────────────────────────────────────────────────────────────────
+hifld_baseline = len(gdf_hifld)  # IN SERVICE count before dedup
 
-print(f"\nFinal CRS: {gdf.crs}")
-print(f"Total IN SERVICE substations: {len(gdf):,}")
+print("=== Final dataset ===")
+print(f"Total substations:  {len(gdf):,}")
+print(f"HIFLD baseline was: {hifld_baseline:,}  (delta: {len(gdf) - hifld_baseline:+,})")
+
+print(f"\nData source breakdown:")
+print(gdf['data_source'].value_counts().to_string())
 
 print(f"\nClass rating breakdown:")
 print(gdf['class_rating'].value_counts(dropna=False).to_string())
 
-print(f"\nVoltage source breakdown:")
-print(gdf['volt_source'].value_counts(dropna=False).to_string())
-
 null_cr = gdf['class_rating'].isna().sum()
-print(f"\nNULL class_rating (no voltage data): {null_cr:,} ({100*null_cr/len(gdf):.1f}%)")
-print("  These have no recovery path within HIFLD.")
-print("  Scoring engine must fall back to transmission line proximity.")
+print(f"\nNULL class_rating: {null_cr:,} ({100*null_cr/len(gdf):.1f}%)")
 
-print(f"\nTarget state breakdown (class_1/2 = high-value, class_3/sub_class/NULL = low-value):")
+print(f"\nTarget state breakdown:")
 for state in ['CA', 'TX', 'AZ', 'NV', 'VA']:
     st = gdf[gdf['state_abbr'] == state]
     cr = st['class_rating'].value_counts(dropna=False)
-    print(f"  {state}: {len(st):,} total | "
-          f"class_1={cr.get('class_1',0)}  class_2={cr.get('class_2',0)}  "
-          f"class_3={cr.get('class_3',0)}  sub_class={cr.get('sub_class',0)}  "
+    print(f"  {state}: {len(st):,} | "
+          f"class_1={cr.get('class_1', 0)}  class_2={cr.get('class_2', 0)}  "
+          f"class_3={cr.get('class_3', 0)}  sub_class={cr.get('sub_class', 0)}  "
           f"NULL={st['class_rating'].isna().sum()}")
 
-# ── Output ────────────────────────────────────────────────────────────────────
+print(f"\nAll-state breakdown (OSM-sourced records):")
+state_counts = gdf[gdf['data_source'] == 'osm']['state_abbr'].value_counts().sort_index()
+print(state_counts.to_string())
 
+# ── Output ────────────────────────────────────────────────────────────────────
 gdf.to_parquet(OUT_PARQUET, index=False)
-print(f"\nWrote {OUT_PARQUET} ({OUT_PARQUET.stat().st_size / 1e6:.1f} MB)")
+print(f"\nWrote {OUT_PARQUET.name} ({OUT_PARQUET.stat().st_size / 1e6:.1f} MB)")
+
+sample = gdf.head(20).copy()
+sample.drop(columns='geometry').to_csv(HERE / 'sample_rows.csv', index=False)
+sample.to_file(HERE / 'sample_rows.geojson', driver='GeoJSON')
+print("Exported: sample_rows.csv and sample_rows.geojson")

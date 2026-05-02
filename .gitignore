@@ -9,12 +9,32 @@
 *.cpg
 *.geojson
 *.csv
+*.tif
+*.tiff
+*.gpkg
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
 .env
+.env.*
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+
+# Secrets and credentials
+*.key
+secrets.json
+credentials.json
+
+# Internal workspace files
+.claude/
+OPEN_QUESTIONS_FOR_OWEN.txt
+
+# Editor and OS artifacts
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
