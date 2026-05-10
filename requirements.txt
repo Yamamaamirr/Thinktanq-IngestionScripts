@@ -1,9 +1,21 @@
+# Core geospatial
 geopandas>=0.14
-pandas>=2.0
-numpy>=1.26
-requests>=2.31
 shapely>=2.0
 pyproj>=3.6
+fiona>=1.9
+
+# Raster processing (CDL pipeline - Steps 7a-7c)
+rasterio>=1.3
+scipy>=1.11
+
+# Data I/O
+pandas>=2.0
+numpy>=1.26
 pyarrow>=14.0
+
+# Network / HTTP
+requests>=2.31
 urllib3>=2.0
+
+# Fuzzy matching (ISO queue substation name matching)
 rapidfuzz>=3.0

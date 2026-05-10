@@ -151,6 +151,7 @@ def main():
     matched_only['_active'] = matched_only['queue_status'] == 'active'
     matched_only['_energized'] = matched_only['queue_status'] == 'energized'
     matched_only['_withdrawn'] = matched_only['queue_status'] == 'withdrawn'
+    matched_only['_suspended'] = matched_only['queue_status'] == 'suspended'
     matched_only['_recent_withdrawal'] = (
         matched_only['_withdrawn']
         & matched_only['withdrawal_date'].notna()
@@ -176,8 +177,10 @@ def main():
         total_active_capacity_mw=('capacity_mw', lambda s: s[matched_only.loc[s.index, '_active']].sum()),
         total_energized_capacity_mw=('capacity_mw', lambda s: s[matched_only.loc[s.index, '_energized']].sum()),
         total_withdrawn_capacity_mw=('capacity_mw', lambda s: s[matched_only.loc[s.index, '_withdrawn']].sum()),
+        total_suspended_capacity_mw=('capacity_mw', lambda s: s[matched_only.loc[s.index, '_suspended']].sum()),
         active_project_count=('_active', 'sum'),
         energized_project_count=('_energized', 'sum'),
+        suspended_project_count=('_suspended', 'sum'),
         earliest_active_in_service_date=(
             'in_service_date',
             lambda s: s[matched_only.loc[s.index, '_active_future']].min(),
@@ -219,11 +222,61 @@ def main():
     # All retained dates are >= today by construction, so values are >= 0.
     stats['activation_band'] = stats['estimated_activation_mo'].apply(_activation_band)
 
-    # match_confidence: Owen's requirement — explicit confidence tier for each anchor.
-    # Derived from best_match_method so parcel pipeline doesn't need to recode strings.
+    # match_confidence: explicit confidence tier for each anchor.
     _CONF = {'exact': 'high', 'fuzzy_high': 'high',
              'fuzzy_high_endpoint': 'medium', 'fuzzy_medium': 'medium', 'fuzzy_low': 'low'}
     stats['match_confidence'] = stats['best_match_method'].map(_CONF)
+
+    # queue_mw_tier: tiered MW signal strength — used for scoring at Stage 9.
+    # <25 MW is noise at this scale; 200+ MW is unambiguous developer convergence.
+    # Note: the keep-zone spatial filter stays at >=200 MW (with rescue clauses).
+    # Tiering is a scoring signal, not a justification to expand the spatial filter —
+    # the net-new substations a 25 MW floor would add are predominantly sub-138 kV
+    # distribution nodes that cannot serve large-format infrastructure loads.
+    def _mw_tier(mw):
+        if pd.isna(mw) or mw < 25:
+            return 'negligible'
+        if mw < 50:
+            return 'weak'
+        if mw < 100:
+            return 'moderate'
+        if mw < 200:
+            return 'strong'
+        return 'very_strong'
+
+    stats['queue_mw_tier'] = stats['total_active_capacity_mw'].apply(_mw_tier)
+
+    # queue_status_best / queue_status_score: best IA status quality across projects.
+    # Four-tier hierarchy per Owen #3:
+    #   Executed IA  → 100  (active project with ia_executed=True)
+    #   In Study     → 67   (active project, no signed IA; midpoint of Owen's 60-75)
+    #   Suspended    → 37   (suspended project; midpoint of Owen's 30-45)
+    #   No active    → 0
+    # NOTE: suspended scoring requires gridstatus_iso_queues.py STATUS_MAP fix
+    # ("suspended" → "suspended" not "withdrawn"). Re-run the full ingestion chain
+    # (gridstatus_iso_queues → iso_anchor_match → this script) for suspended
+    # records to appear in total_suspended_capacity_mw / suspended_project_count.
+    def _status_score(row):
+        if row['mw_commitment_letter']:
+            return ('executed_ia', 100)
+        if row['active_project_count'] > 0:
+            return ('in_study', 67)
+        if row['suspended_project_count'] > 0:
+            return ('suspended', 37)
+        return ('no_active', 0)
+
+    status_cols = stats.apply(_status_score, axis=1, result_type='expand')
+    stats['queue_status_best'] = status_cols[0]
+    stats['queue_status_score'] = status_cols[1]
+
+    # queue_signal_score: composite of MW tier strength and status quality.
+    # MW tier mapped to 0-100: negligible=0, weak=25, moderate=50, strong=75, very_strong=100
+    # Weighted 60% MW signal + 40% status quality — MW is the primary signal.
+    _MW_SCORE = {'negligible': 0, 'weak': 25, 'moderate': 50, 'strong': 75, 'very_strong': 100}
+    stats['queue_signal_score'] = (
+        stats['queue_mw_tier'].map(_MW_SCORE) * 0.6
+        + stats['queue_status_score'] * 0.4
+    ).round(1)
 
     # line_poi_fraction: proportion of matched rows that are line-tap POIs, not substations.
     # A high fraction flags anchors whose MW totals may be inflated by mis-attributed
@@ -236,11 +289,13 @@ def main():
     stats = stats[[
         'anchor_id', 'anchor_name', 'anchor_state', 'anchor_voltage_kv', 'iso_region',
         'total_active_capacity_mw', 'total_energized_capacity_mw',
-        'total_withdrawn_capacity_mw',
-        'active_project_count', 'energized_project_count', 'active_overdue_count',
+        'total_withdrawn_capacity_mw', 'total_suspended_capacity_mw',
+        'active_project_count', 'energized_project_count', 'suspended_project_count',
+        'active_overdue_count',
         'earliest_active_in_service_date', 'estimated_activation_mo', 'activation_band',
         'recent_withdrawal_count_12mo', 'recent_withdrawal_capacity_mw_12mo',
         'mw_commitment_letter',
+        'queue_mw_tier', 'queue_status_best', 'queue_status_score', 'queue_signal_score',
         'best_match_method', 'match_confidence', 'match_count',
         'line_poi_count', 'line_poi_fraction',
         'geometry',

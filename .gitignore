@@ -11,7 +11,16 @@
 *.csv
 *.tif
 *.tiff
+*.tif.vat.dbf
+*.img.vat.dbf
 *.gpkg
+*.docx
+
+# Large derived data directories (all contents ignored)
+candidate_areas/data/
+candidate_areas/outputs/
+candidate_areas/exclusion_layers/
+enrichment/
 
 # Python
 __pycache__/
@@ -32,6 +41,18 @@ credentials.json
 # Internal workspace files
 .claude/
 OPEN_QUESTIONS_FOR_OWEN.txt
+workflow_context.txt
+
+# FlatGeobuf vector outputs (large derived data, not for Git)
+*.fgb
+
+# PDF reports and markdown drafts (generated locally, not for Git)
+*.pdf
+Phase1_Progress_Report.md
+
+# Helper/utility scripts (not pipeline)
+generate_pdf.py
+generate_spec_doc.py
 
 # Editor and OS artifacts
 .vscode/

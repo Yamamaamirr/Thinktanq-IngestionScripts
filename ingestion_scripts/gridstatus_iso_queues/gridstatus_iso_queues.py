@@ -65,7 +65,7 @@ STATUS_MAP = {
     "complete":            "energized",
     "withdrawn":           "withdrawn",
     "cancelled":           "withdrawn",
-    "suspended":           "withdrawn",
+    "suspended":           "suspended",   # weak positive signal (score 30-45); not withdrawn
 }
 
 

@@ -6,29 +6,34 @@ Source: HIFLD (Homeland Infrastructure Foundation-Level Data), DHS/CISA.
 
 What this dataset IS:
   Every electric transmission line segment in the US >= 100 kV, as mapped by
-  HIFLD from utility filings and aerial imagery. This script keeps only IN
-  SERVICE lines at 220 kV and above (the voltage classes relevant for
-  industrial / data center load interconnection).
+  HIFLD from utility filings and aerial imagery. This script keeps all IN
+  SERVICE lines at 100 kV and above, classified into four tiers per PRD v2.1.
 
 What it IS NOT:
   - No distribution lines (< 100 kV)
   - No substations (see hifld_electric_substations script)
   - No generation / capacity data (see eia_form860 script)
 
-Voltage → class_rating mapping (used by parcel scoring engine, matches PRD class_weight_mapping):
-  735 kV+ / DC  →  class_1   (regional backbone and above — PRD has no class_0)
-  345–500 kV    →  class_1   (high, regional backbone)
-  220–287 kV    →  class_2   (medium, sub-regional / metro feeds)
+Voltage → class_rating mapping (matches PRD v2.1 class_weight_mapping exactly):
+  735 kV+ / DC  →  class_1    weight 500  (regional backbone)
+  500 kV        →  class_1    weight 500  (regional backbone)
+  345 kV        →  class_2    weight 345  (high-capacity sub-regional)
+  220–287 kV    →  class_3    weight 230  (sub-regional / metro feeds)
+  100–161 kV    →  sub_class  weight 138  (local transmission, includes 138kV)
+
+Note for keep-zone buffering: only class_1 and class_2 (345kV+) are buffered
+in build_keep_zones.py. class_3 and sub_class are retained in this parquet
+for scoring use only (infrastructure_proximity_score).
 
 Output schema (PostGIS GEOMETRY(LINESTRING, 4326)):
-  voltage_kv     NUMERIC   actual kV (imputed from volt_class where null)
-  volt_class     TEXT      HIFLD voltage class label
-  owner          TEXT      utility / owner name
-  substation_from TEXT     upstream substation name
-  substation_to   TEXT     downstream substation name
-  class_rating   TEXT      class_1 / class_2
-  geometry       LINESTRING(4326)
-  ingested_at    TIMESTAMPTZ
+  voltage_kv      NUMERIC   actual kV (imputed from volt_class where null)
+  volt_class      TEXT      HIFLD voltage class label
+  owner           TEXT      utility / owner name
+  substation_from TEXT      upstream substation name
+  substation_to   TEXT      downstream substation name
+  class_rating    TEXT      class_1 / class_2 / class_3 / sub_class
+  geometry        LINESTRING(4326)
+  ingested_at     TIMESTAMPTZ
 """
 import numpy as np
 import geopandas as gpd
@@ -49,14 +54,15 @@ VOLT_CLASS_LOWER = {
     '735 AND ABOVE': 735,
 }
 
-SCORING_CLASSES = {'220-287', '345', '500', '735 AND ABOVE', 'DC'}
+SCORING_CLASSES = {'100-161', '220-287', '345', '500', '735 AND ABOVE', 'DC'}
 
 CLASS_RATING_MAP = {
-    '220-287':       'class_2',
-    '345':           'class_1',
-    '500':           'class_1',
-    '735 AND ABOVE': 'class_1',
-    'DC':            'class_1',
+    '100-161':       'sub_class',  # 138kV local transmission
+    '220-287':       'class_3',    # sub-regional / metro feeds
+    '345':           'class_2',    # high-capacity sub-regional
+    '500':           'class_1',    # regional backbone
+    '735 AND ABOVE': 'class_1',    # regional backbone
+    'DC':            'class_1',    # regional backbone (HVDC)
 }
 
 # ── Load ─────────────────────────────────────────────────────────────────────
@@ -79,7 +85,7 @@ gdf = gdf[gdf['STATUS'] == 'IN SERVICE']
 print(f"After IN SERVICE filter: {len(gdf):,}")
 
 gdf = gdf[gdf['VOLT_CLASS'].isin(SCORING_CLASSES)]
-print(f"After voltage class filter (220 kV+): {len(gdf):,}")
+print(f"After voltage class filter (100 kV+): {len(gdf):,}")
 
 # ── Geometry ──────────────────────────────────────────────────────────────────
 
@@ -108,7 +114,7 @@ gdf['ingested_at'] = pd.Timestamp.utcnow()
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-assert len(gdf) > 8_000, f"Suspiciously low segment count: {len(gdf):,}"
+assert len(gdf) > 15_000, f"Suspiciously low segment count: {len(gdf):,}"
 assert gdf.geom_type.eq('LineString').all(), "Non-LineString geometry found after explode"
 assert gdf.geometry.is_valid.all(), "Invalid geometries detected"
 assert gdf['class_rating'].notna().all(), "Unmapped volt_class found"
