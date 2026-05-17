@@ -1,4 +1,6 @@
+# =====================================================================
 # Cache and generated data files
+# =====================================================================
 **/cache/
 *.parquet
 *.zip
@@ -7,55 +9,125 @@
 *.shx
 *.prj
 *.cpg
+*.sbn
+*.sbx
+*.shp.xml
 *.geojson
 *.csv
+*.json.gz
 *.tif
 *.tiff
 *.tif.vat.dbf
 *.img.vat.dbf
+*.img
+*.gdb/
+*.kmz
+*.kml
 *.gpkg
+*.fgb
+*.las
+*.laz
+*.nc
+*.hdf
+*.h5
 *.docx
+*.xlsx
+*.xls
 
+# =====================================================================
 # Large derived data directories (all contents ignored)
+# =====================================================================
 candidate_areas/data/
 candidate_areas/outputs/
 candidate_areas/exclusion_layers/
+candidate_areas/enrichment_outputs/
+candidate_areas/states/
 enrichment/
+enrichment_outputs/
 
+# Per-source raw downloads (any subdirectory named data/, raw/, cache/, downloads/, or *_raw/)
+ingestion_scripts/*/data/
+ingestion_scripts/*/raw/
+ingestion_scripts/*/downloads/
+ingestion_scripts/*/cache/
+ingestion_scripts/*/cache_osm/
+ingestion_scripts/*/*_raw/
+
+# =====================================================================
+# ArcMap / ArcGIS Pro / QGIS workspace files (visualization-only)
+# =====================================================================
+*.lyrx
+*.lyr
+*.mxd
+*.mxt
+*.aprx
+*.mpkx
+*.qgs
+*.qgz
+*.qpt
+
+# =====================================================================
 # Python
+# =====================================================================
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .env
 .env.*
+.venv/
+venv/
+env/
 *.egg-info/
 dist/
 build/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
+# =====================================================================
 # Secrets and credentials
+# =====================================================================
 *.key
+*.pem
 secrets.json
 credentials.json
+.env.local
+.env.production
 
-# Internal workspace files
+# =====================================================================
+# Internal workspace and scratch files
+# =====================================================================
 .claude/
 OPEN_QUESTIONS_FOR_OWEN.txt
 workflow_context.txt
+leftover.txt
+notes.txt
+scratch.txt
+TODO.txt
 
-# FlatGeobuf vector outputs (large derived data, not for Git)
-*.fgb
-
-# PDF reports and markdown drafts (generated locally, not for Git)
+# =====================================================================
+# Reports and generated docs
+# =====================================================================
 *.pdf
 Phase1_Progress_Report.md
+RUN_LOG.md
+audit_report*.txt
+attribute_audit.txt
 
+# =====================================================================
 # Helper/utility scripts (not pipeline)
+# =====================================================================
 generate_pdf.py
 generate_spec_doc.py
 
+# =====================================================================
 # Editor and OS artifacts
+# =====================================================================
 .vscode/
 .idea/
 *.DS_Store
 Thumbs.db
+*.swp
+*.swo
+*~

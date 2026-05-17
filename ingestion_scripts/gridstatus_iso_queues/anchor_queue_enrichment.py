@@ -68,7 +68,7 @@ METHOD_RANK = {
     'fuzzy_low': 0,
 }
 
-SUBS_PARQUET = Path(r'C:\thinqtank\ingestion_scripts\hifld_electric_substations\hifld_electric_substations.parquet')
+SUBS_PARQUET = Path(__file__).resolve().parent.parent / 'hifld_electric_substations' / 'hifld_electric_substations.parquet'
 SUPP_PARQUET = Path(__file__).parent / 'supplemental_substations.parquet'
 QUEUE_PARQUET = Path(__file__).parent / 'iso_queues.parquet'
 OUT_PARQUET = Path(__file__).parent / 'anchor_queue_stats.parquet'

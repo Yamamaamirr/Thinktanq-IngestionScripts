@@ -30,7 +30,7 @@ from shapely.geometry import Point
 from shapely.wkb import loads as wkb_loads
 
 BASE = Path(__file__).parent
-EIA_PARQUET = Path(r'C:\thinqtank\ingestion_scripts\eia_form860\eia_form860.parquet')
+EIA_PARQUET = BASE.parent / 'eia_form860' / 'eia_form860.parquet'
 OUT_PARQUET  = BASE / 'supplemental_substations.parquet'
 
 # States where unmatched active MW is largest — targeted OSM scrape.

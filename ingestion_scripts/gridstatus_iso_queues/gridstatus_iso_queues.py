@@ -318,12 +318,15 @@ def _parse_ercot_gis(path):
     return combined
 
 
-# ERCOT_GIS_PATH: set to the path of a manually downloaded GIS Report xlsx.
+# ERCOT_GIS_PATH: set ERCOT_GIS_PATH env var to a manually downloaded GIS Report xlsx
+# (the script tries gridstatus live API first; this file is only used as fallback).
 # Download from: https://www.ercot.com/misapp/GetReports.do?reportTypeId=15933
 # Select the most recent GIS_Report_*.xlsx file.
+# Default path: manual_downloads/ercot_gis_report.xlsx next to this script.
+_THIS_DIR = Path(__file__).parent
 ERCOT_GIS_PATH = os.environ.get(
     "ERCOT_GIS_PATH",
-    r"C:\Users\dell\Downloads\RPT.00015933.0000000000000000.20260402.154703469.GIS_Report_March2026.xlsx",
+    str(_THIS_DIR / "manual_downloads" / "ercot_gis_report.xlsx"),
 )
 
 
@@ -357,12 +360,13 @@ def _fetch_ercot():
         raise
 
 
-# LBNL_QUEUE_PATH: set to the path of the LBNL "Queued Up" Excel data file.
+# LBNL_QUEUE_PATH: set LBNL_QUEUE_PATH env var to the LBNL "Queued Up" Excel data file.
 # Download "Queued Up 2025 Data File XLSX" from: https://emp.lbl.gov/queues
 # Covers non-ISO AZ/NV utilities: APS, SRP, TEP (AZ) and NV Energy (NV).
+# Default path: manual_downloads/lbnl_queue.xlsx next to this script.
 LBNL_QUEUE_PATH = os.environ.get(
     "LBNL_QUEUE_PATH",
-    r"C:\Users\dell\Downloads\LBNL_Ix_Queue_Data_File_thru2024_v2.xlsx",
+    str(_THIS_DIR / "manual_downloads" / "lbnl_queue.xlsx"),
 )
 
 # Maps LBNL entity codes to iso_region values in the iso_queues schema.
