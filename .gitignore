@@ -41,6 +41,8 @@ candidate_areas/data/
 candidate_areas/outputs/
 candidate_areas/exclusion_layers/
 candidate_areas/enrichment_outputs/
+candidate_areas/reuse_node_outputs/
+candidate_areas/reuse_node_enrichment_outputs/
 candidate_areas/states/
 enrichment/
 enrichment_outputs/
